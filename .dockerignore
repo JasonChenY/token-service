@@ -1,0 +1,8 @@
+.env
+.env.*
+*.pyc
+__pycache__/
+gen_temp_token.py
+readme.md
+Dockerfile
+.dockerignore
