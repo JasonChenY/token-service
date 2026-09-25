@@ -31,16 +31,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY token_service.py .
+COPY token_service.py entrypoint.sh ./
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
 
-# 进程内缓存需在同一进程共享,故用「单 worker + 多线程」:
-#   多 worker 会各自持有独立缓存,命中率下降(要多副本共享请改用 Redis)。
-# 密钥等通过运行时 -e / --env-file 注入,不写进镜像。
-CMD ["gunicorn", "--workers", "1", "--threads", "8", "--timeout", "60", \
-     "--bind", "0.0.0.0:8080", "token_service:app"]
+# 启动入口:按 TLS_CERT/TLS_KEY 决定 HTTP 或 HTTPS(见 entrypoint.sh)。
+ENTRYPOINT ["/app/entrypoint.sh"]
 
-# 健康检查:已装 curl,直接探活 /healthz。
+# 健康检查:按是否配置 TLS 切换 http/https。自签/内网证书用 -k 跳过校验。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+  CMD (if [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ]; then \
+        curl -fsSk https://127.0.0.1:${LISTEN_PORT:-8080}/healthz; \
+      else \
+        curl -fsS http://127.0.0.1:${LISTEN_PORT:-8080}/healthz; \
+      fi) || exit 1

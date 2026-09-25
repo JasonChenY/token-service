@@ -1,4 +1,5 @@
-flask
+mcp
+uvicorn
 gunicorn
 tencentcloud-sdk-python
 python-dotenv
