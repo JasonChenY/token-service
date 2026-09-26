@@ -19,10 +19,10 @@
   无 token 时返回 401 + WWW-Authenticate: Bearer resource_metadata=<本 RS 的 /.well-known/
   oauth-protected-resource>(RFC 6750 + RFC 9728)。客户端据此发现 AS,再从 AS 的
   .well-known 读到真实 authorization_endpoint 自行走授权码流程——本服务不硬编码
-  任何 AS 端点。token 为 JWT(公开/PKCE client 所发),资源服务器用 AS 的
-  JWKS(jwks_uri,亦从 .well-known 发现)本地验签并校验签发方/过期;username 取自
-  claims(默认 preferred_username)。无需 client secret,也不走 introspection。默认 AS 为 Keycloak
-  issuer=https://keycloak.eit217.cn/realms/eit217。
+  任何 AS 端点。资源服务器用「机密(confidential)client」调 AS introspection(RFC 7662,
+  端点亦从 .well-known 发现)校验 token,client_secret_basic 认证,需配
+  OAUTH2_CLIENT_ID + OAUTH2_CLIENT_SECRET;username 取自 introspection 响应
+  (默认 preferred_username)。默认 AS 为 Keycloak issuer=https://keycloak.eit217.cn/realms/eit217。
 
 约定:
 - token 有效期(DurationSeconds)不传时默认 7200s。
@@ -42,8 +42,9 @@
   OPENID_RESOURCE_SERVER     开启 OAuth2 RS 模式         (选填,默认 false)
   OAUTH2_AS_ISSUER           AS issuer                   (选填,默认 https://keycloak.eit217.cn/realms/eit217)
   RESOURCE_URL               本 RS 对外规范 URL           (RS 模式建议配,用于 RFC9728 资源元数据)
-  OAUTH2_CLIENT_ID           本 RS 关联的 client(公开/PKCE,选填,默认 ags-mcp-server)
-  OAUTH2_AS_USERNAME_FIELD   从 JWT claims 取 username 的字段 (选填,默认 preferred_username)
+  OAUTH2_CLIENT_ID           机密 client id(introspection) (RS 模式必填,默认 ags-mcp-server)
+  OAUTH2_CLIENT_SECRET       机密 client secret(introspection) (RS 模式必填)
+  OAUTH2_AS_USERNAME_FIELD   从 introspection 响应取 username 的字段 (选填,默认 preferred_username)
 
 依赖:
   pip install mcp uvicorn gunicorn tencentcloud-sdk-python python-dotenv
@@ -69,6 +70,7 @@
 get_temporary_credentials(RS 模式无须传 username,鉴权走 Bearer 头)。
 """
 
+import base64
 import json
 import os
 import re
@@ -80,7 +82,6 @@ import urllib.request
 
 import anyio
 from dotenv import load_dotenv
-import jwt
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from starlette.requests import Request
@@ -115,15 +116,27 @@ def _flag(name: str, default: str = "false") -> bool:
 RESOURCE_SERVER = _flag("OPENID_RESOURCE_SERVER", "false")
 
 # ---- OAuth2 授权服务器(AS) ----
-# 只配 issuer;jwks_uri/authorization/token 等端点一律从 AS 的 .well-known
+# 只配 issuer;introspection/authorization/token 等端点一律从 AS 的 .well-known
 # 元数据(OIDC discovery / RFC 8414)动态发现,不按厂商路径硬拼(避免 Keycloak
 # /auth vs /authorize 之类的差异)。
 AS_ISSUER = os.environ.get("OAUTH2_AS_ISSUER", "https://keycloak.eit217.cn/realms/eit217").rstrip("/")
 AS_USERNAME_FIELD = os.environ.get("OAUTH2_AS_USERNAME_FIELD", "preferred_username")
+# RS 用「机密(confidential)client」调 AS introspection 校验 token:
+# OAUTH2_CLIENT_ID + OAUTH2_CLIENT_SECRET 走 client_secret_basic 认证。
+# RS 模式下二者必填(见 missing_config),且该 client 需在 Keycloak 里有 introspection 权限。
 OAUTH2_CLIENT_ID = os.environ.get("OAUTH2_CLIENT_ID", "ags-mcp-server")
+OAUTH2_CLIENT_SECRET = os.environ.get("OAUTH2_CLIENT_SECRET", "")
 # RS 对外规范 URL(如 https://ags-mcp-server.eit217.cn:8443),用于 RFC 9728 受保护资源
 # 元数据。反代/端口映射下 request.host 不可靠,建议显式配置。
 RESOURCE_URL = os.environ.get("RESOURCE_URL", "").rstrip("/")
+
+class ASUnavailable(Exception):
+    """授权服务器 / introspection 端点不可达或返回异常(上游问题 → 502)。"""
+
+
+class TokenInvalid(Exception):
+    """access token 无效 / 过期 / 未激活(客户端问题 → 401)。"""
+
 
 # AS 元数据发现缓存:成功 fetch 一次后复用。
 _as_metadata: dict = {}
@@ -131,7 +144,7 @@ _as_metadata_lock = threading.Lock()
 
 
 def as_metadata() -> dict:
-    """获取并缓存 AS 元数据(优先 OIDC discovery,回退 RFC 8414)。失败抛 RuntimeError。"""
+    """获取并缓存 AS 元数据(优先 OIDC discovery,回退 RFC 8414)。失败抛 ASUnavailable。"""
     with _as_metadata_lock:
         if _as_metadata:
             return dict(_as_metadata)
@@ -147,22 +160,7 @@ def as_metadata() -> dict:
             return meta
         except (urllib.error.URLError, TimeoutError, ValueError) as e:
             last_err = e
-    raise RuntimeError(f"无法获取 AS 元数据({AS_ISSUER}): {last_err}")
-
-
-# JWKS 客户端缓存(按 jwks_uri):PyJWKClient 自带 key 缓存与按需刷新。
-_jwks_clients: dict[str, "jwt.PyJWKClient"] = {}
-_jwks_lock = threading.Lock()
-
-
-def _jwks_client(jwks_uri: str):
-    """返回(并缓存)对应 jwks_uri 的 PyJWKClient。"""
-    with _jwks_lock:
-        client = _jwks_clients.get(jwks_uri)
-        if client is None:
-            client = jwt.PyJWKClient(jwks_uri)
-            _jwks_clients[jwks_uri] = client
-    return client
+    raise ASUnavailable(f"无法获取 AS 元数据({AS_ISSUER}): {last_err}")
 
 
 def _prm_url() -> str:
@@ -230,37 +228,53 @@ def get_credentials(session_name: str, duration: int) -> tuple[dict, bool]:
     return creds, False
 
 
-def validate_access_token(access_token: str) -> dict:
-    """本地校验 JWT access token(无需 client secret,适用于公开/PKCE client)。
+def introspect_token(access_token: str) -> dict:
+    """用「机密 client」调 AS introspection(RFC 7662)校验 access token。
 
-    用 AS 公布的 JWKS(jwks_uri)验签,并校验签发方(iss)/过期(exp)。返回 claims dict。
-    抛 RuntimeError 表示不可校验:AS 不可达 / 无 jwks_uri / 签名无效 / 过期 / 格式错。
+    以 client_secret_basic(Authorization: Basic base64(client_id:client_secret))认证,
+    Keycloak 机密 client 的默认方式;introspection_endpoint 从 AS .well-known 发现。
+    返回 introspection 响应 dict。
+
+    异常区分:
+    - ASUnavailable:AS/introspection 不可达、无端点、HTTP 错误(含 client 认证失败)、
+      解析失败——属上游/配置问题,调用方应回 502。
+    - TokenInvalid:introspection 返回 active!=true——属客户端问题,调用方应回 401。
     """
-    meta = as_metadata()  # 可能抛 RuntimeError(AS 不可达)
-    jwks_uri = meta.get("jwks_uri")
-    if not jwks_uri:
-        raise RuntimeError("AS 元数据未提供 jwks_uri")
+    meta = as_metadata()  # 失败抛 ASUnavailable
+    url = meta.get("introspection_endpoint")
+    if not url:
+        raise ASUnavailable("AS 元数据未提供 introspection_endpoint")
 
+    basic = base64.b64encode(
+        f"{OAUTH2_CLIENT_ID}:{OAUTH2_CLIENT_SECRET}".encode()
+    ).decode()
+    data = urllib.parse.urlencode({"token": access_token}).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {basic}",
+        },
+    )
     try:
-        signing_key = _jwks_client(jwks_uri).get_signing_key_from_jwt(access_token).key
-        # 验签 + iss + exp;aud 由 client 自行决定(公开 PKCE token 的 aud 多变),不强制校验。
-        claims = jwt.decode(
-            access_token,
-            signing_key,
-            algorithms=["RS256"],
-            issuer=AS_ISSUER,
-            options={"verify_aud": False},
-        )
-    except jwt.PyJWTError as e:
-        raise RuntimeError(str(e)) from None
-    return claims
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # 非 2xx(如 client_secret 错 → 401)是我们与 AS 之间的问题,不等同用户 token 失效。
+        raise ASUnavailable(f"introspection endpoint returned HTTP {e.code}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise ASUnavailable(f"introspection request failed: {e}") from None
+
+    if not info.get("active"):
+        raise TokenInvalid("token inactive or invalid")
+    return info
 
 
-def username_from_claims(claims: dict) -> str:
-    """从 JWT claims 里取 username(默认字段名 preferred_username,可配),回退 sub/username。"""
-    value = claims.get(AS_USERNAME_FIELD)
+def username_from_claims(info: dict) -> str:
+    """从 introspection 响应里取 username(默认 preferred_username,可配),回退 sub/username。"""
+    value = info.get(AS_USERNAME_FIELD)
     if value is None:
-        value = claims.get("sub") or claims.get("username")
+        value = info.get("sub") or info.get("username")
     return str(value).strip() if value else ""
 
 
@@ -296,11 +310,18 @@ def read_duration(body: dict | None, query) -> int:
 
 def missing_config() -> list[str] | None:
     """返回缺失的必填配置名;无缺失返回 None。"""
-    miss = [name for name, value in (
+    checks = [
         ("TENCENTCLOUD_SECRET_ID", SECRET_ID),
         ("TENCENTCLOUD_SECRET_KEY", SECRET_KEY),
         ("ROLE_ARN", ROLE_ARN),
-    ) if not value]
+    ]
+    if RESOURCE_SERVER:
+        # 机密 client introspection 需要 client_id + client_secret。
+        checks += [
+            ("OAUTH2_CLIENT_ID", OAUTH2_CLIENT_ID),
+            ("OAUTH2_CLIENT_SECRET", OAUTH2_CLIENT_SECRET),
+        ]
+    miss = [name for name, value in checks if not value]
     return miss or None
 
 
@@ -327,31 +348,33 @@ def unauthorized() -> tuple[int, dict, dict]:
 
 
 def resolve_username_rs(headers) -> tuple[str | None, str | None]:
-    """RS 模式:本地校验 Bearer JWT 取 username(无需 client secret)。
+    """RS 模式:机密 client introspection 校验 Bearer token,取 username。
 
-    返回 (username, error)。username 非空且 error 为 None 表示鉴权通过;
-    否则 error 给出可读原因(username 为 None)。
+    返回 (username, error)。username 非空且 error 为 None 表示鉴权通过(→200);
+    error 非 None 表示 token 无效(→401)。AS 不可达则抛 ASUnavailable 向上传播(→502)。
     """
     token = extract_bearer(headers)
     if not token:
         return None, "missing access token (Authorization: Bearer <access_token>)"
 
     try:
-        claims = validate_access_token(token)
-    except RuntimeError as e:
-        # 校验失败:签名无效/过期/AS 不可达等统一报,validate_access_token 已给出原因。
+        info = introspect_token(token)   # ASUnavailable 不在此捕获,向上抛 → 502
+    except TokenInvalid as e:
         return None, f"{e}"
 
-    username = username_from_claims(claims)
+    username = username_from_claims(info)
     if not username:
-        return None, "token valid but no username in claims"
+        return None, "token valid but no username in introspection response"
     return username, None
 
 
 def credentials_logic(headers, body: dict | None, query) -> tuple[int, dict, dict]:
     """REST /credentials 的纯逻辑:鉴权 → 取凭证 → 返回 (status, body, extra_headers)。"""
     if RESOURCE_SERVER:
-        username, err = resolve_username_rs(headers)
+        try:
+            username, err = resolve_username_rs(headers)
+        except ASUnavailable as e:
+            return 502, {"error": "authorization server unavailable", "detail": str(e)}, {}
         if err is not None:
             return unauthorized()
     else:
@@ -379,7 +402,8 @@ mcp_server = MCPServer(
         "签发腾讯云临时凭证(STS AssumeRole)的 MCP 服务。"
         "工具:get_temporary_credentials 返回 TENCENTCLOUD_SECRET_ID/KEY/TOKEN(+过期时间、是否命中缓存)。"
         "RS 模式(OPENID_RESOURCE_SERVER=true)下用 Authorization: Bearer <access_token> "
-        "鉴权(本地 JWKS 验签 JWT),username 取自 claims,工具无须传 username;非 RS 模式下 username 由调用方传入。"
+        "鉴权(机密 client 调 AS introspection),username 取自 introspection 响应,工具无须传 username;"
+        "非 RS 模式下 username 由调用方传入。"
     ),
 )
 
@@ -393,7 +417,7 @@ async def get_temporary_credentials(
     """签发(带缓存)腾讯云临时凭证。
 
     RS 模式下无须传 username——鉴权走请求的 Authorization: Bearer 头,
-    username 取自 JWT claims(本地 JWKS 验签);duration 缺省用服务默认值。
+    username 取自 introspection 响应(机密 client 调 AS introspection);duration 缺省用服务默认值。
     非 RS 模式下 username 必填,duration 可选。
 
     返回:TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY / TENCENTCLOUD_TOKEN、
@@ -405,8 +429,11 @@ async def get_temporary_credentials(
 
     headers = ctx.headers or {}
     if RESOURCE_SERVER:
-        # JWKS 验签是阻塞网络调用,下放到线程池避免阻塞事件循环。
-        resolved, err = await anyio.to_thread.run_sync(resolve_username_rs, headers)
+        # introspection 是阻塞网络调用,下放到线程池避免阻塞事件循环。
+        try:
+            resolved, err = await anyio.to_thread.run_sync(resolve_username_rs, headers)
+        except ASUnavailable as e:
+            raise ToolError(f"authorization server unavailable: {e}") from None
         if err is not None:
             raise ToolError(err)
         username = resolved  # type: ignore[assignment]
