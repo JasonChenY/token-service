@@ -12,6 +12,8 @@
 
 ### RS 模式（OAuth2 Resource Server）
 
+> 架构图（发现 + 鉴权 + 签发全流程）见 [`docs/rs-architecture.html`](docs/rs-architecture.html)，用浏览器打开即可。
+
 开启 `OPENID_RESOURCE_SERVER=true` 后，服务变为标准的 OAuth2 resource server（RFC 6750 + RFC 9728）：
 
 - 请求必须携带 `Authorization: Bearer <access_token>`。
